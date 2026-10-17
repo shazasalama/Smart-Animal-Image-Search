@@ -1,0 +1,6 @@
+streamlit
+torch
+torchvision
+scikit-learn
+pillow
+numpy
