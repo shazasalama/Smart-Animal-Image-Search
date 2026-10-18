@@ -1,31 +1,32 @@
 import streamlit as st
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from PIL import Image
 from pathlib import Path
-from torchvision.models import resnet18, ResNet18_Weights
-from sklearn.metrics.pairwise import cosine_similarity
-
+from transformers import AutoImageProcessor, AutoModel
 
 st.set_page_config(
     page_title="Smart Animal Image Search",
     page_icon="🐾",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("🐾 Smart Animal Image Search")
 st.write(
-    "Upload an animal image to find visually similar "
-    "images from the Animals-10 dataset."
+    "Content-Based Image Retrieval (CBIR): upload an image and retrieve "
+    "the most visually similar images from the Animals-10 dataset."
 )
 
 BASE_DIR = Path(__file__).resolve().parent
 DATASET_PATH = BASE_DIR / "dataset"
 
-MAX_IMAGES = 500
-TOP_RESULTS = 5
+MODEL_NAME = "facebook/dinov2-small"
+
+MAX_IMAGES_PER_CATEGORY = 50
+DEFAULT_TOP_K = 10
+MAX_TOP_K = 20
 
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
@@ -39,7 +40,7 @@ FOLDER_CATEGORIES = {
     "mucca": "cow",
     "pecora": "sheep",
     "ragno": "spider",
-    "scoiattolo": "squirrel"
+    "scoiattolo": "squirrel",
 }
 
 CATEGORY_NAMES = {
@@ -52,353 +53,467 @@ CATEGORY_NAMES = {
     "cow": "Cows",
     "sheep": "Sheep",
     "spider": "Spiders",
-    "squirrel": "Squirrels"
+    "squirrel": "Squirrels",
 }
 
-@st.cache_resource
-def load_models():
-    weights = ResNet18_Weights.DEFAULT
+DEEP_FEATURE_WEIGHT = 0.95
+COLOR_FEATURE_WEIGHT = 0.05
+COLOR_BINS_PER_CHANNEL = 16
 
-    classifier = resnet18(weights=weights)
-    classifier.eval()
+INDEX_VERSION = "dinov2-small-cls-patches-v1"
 
-    feature_model = nn.Sequential(
-        *list(classifier.children())[:-1]
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+@st.cache_resource(show_spinner="Loading DINOv2 Small...")
+def load_model():
+    processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+    model = AutoModel.from_pretrained(MODEL_NAME)
+
+    model = model.to(DEVICE)
+    model.eval()
+
+    return model, processor
+
+def color_histogram(image):
+    image = image.convert("RGB").resize((128, 128))
+    array = np.asarray(image, dtype=np.uint8)
+
+    histograms = []
+
+    for channel in range(3):
+        hist, _ = np.histogram(
+            array[:, :, channel],
+            bins=COLOR_BINS_PER_CHANNEL,
+            range=(0, 256),
+        )
+
+        hist = hist.astype(np.float32)
+        hist /= hist.sum() + 1e-12
+        histograms.append(hist)
+
+    vector = np.concatenate(histograms).astype(np.float32)
+    vector /= np.linalg.norm(vector) + 1e-12
+
+    return vector
+
+def extract_features(image, model, processor):
+    image = image.convert("RGB")
+
+    inputs = processor(
+        images=image,
+        return_tensors="pt",
     )
-    feature_model.eval()
 
-    preprocess = weights.transforms()
-    labels = weights.meta["categories"]
-
-    return classifier, feature_model, preprocess, labels
-
-def identify_category(label):
-    name = label.lower()
-
-    cat_words = [
-        "tabby", "tiger cat", "persian cat",
-        "siamese cat", "egyptian cat", "lynx",
-        "cougar", "lion", "tiger", "leopard",
-        "snow leopard", "jaguar", "cheetah"
-    ]
-
-    if any(word in name for word in cat_words):
-        return "cat"
-
-    dog_words = [
-        "dog", "retriever", "terrier", "spaniel",
-        "shepherd", "collie", "poodle", "pug",
-        "beagle", "bulldog", "chihuahua", "husky",
-        "malamute", "rottweiler", "doberman",
-        "pinscher", "schnauzer", "greyhound",
-        "whippet", "boxer", "mastiff", "dachshund",
-        "corgi", "dalmatian", "papillon", "pekinese",
-        "shih-tzu", "chow", "akita", "samoyed",
-        "keeshond", "briard", "basenji",
-        "affenpinscher", "mexican hairless",
-        "wolfhound", "tervuren", "schipperke",
-        "lhasa", "vizsla", "kuvasz", "malinois"
-    ]
-
-    if any(word in name for word in dog_words):
-        return "dog"
-
-    if any(word in name for word in [
-        "horse", "sorrel", "stallion", "colt", "mare"
-    ]):
-        return "horse"
-
-    if "elephant" in name:
-        return "elephant"
-
-    if any(word in name for word in [
-        "butterfly", "monarch", "sulphur butterfly",
-        "lycaenid"
-    ]):
-        return "butterfly"
-
-    if any(word in name for word in [
-        "hen", "cock", "rooster", "chicken"
-    ]):
-        return "chicken"
-
-    if any(word in name for word in [
-        "cow", "ox", "bull", "bison", "water buffalo"
-    ]):
-        return "cow"
-
-    if any(word in name for word in [
-        "sheep", "ram", "bighorn", "wether"
-    ]):
-        return "sheep"
-
-    if any(word in name for word in [
-        "spider", "tarantula", "garden spider",
-        "wolf spider", "black widow"
-    ]):
-        return "spider"
-
-    if any(word in name for word in [
-        "squirrel", "marmot", "chipmunk"
-    ]):
-        return "squirrel"
-
-    return None
-
-
-def predict_animal(image, classifier, preprocess, labels):
-    tensor = preprocess(image).unsqueeze(0)
+    inputs = {
+        key: value.to(DEVICE)
+        for key, value in inputs.items()
+    }
 
     with torch.inference_mode():
-        output = classifier(tensor)
-        probabilities = torch.softmax(output, dim=1)[0]
+        outputs = model(**inputs)
 
-    top_indices = torch.argsort(
-        probabilities, descending=True
-    )[:10].tolist()
+        tokens = outputs.last_hidden_state
 
-    for index in top_indices:
-        category = identify_category(labels[index])
+        cls_vector = F.normalize(
+            tokens[:, 0, :],
+            p=2,
+            dim=1,
+        )
 
-        if category is not None:
-            return category, probabilities[index].item(), labels[index]
+        patch_vector = F.normalize(
+            tokens[:, 1:, :].mean(dim=1),
+            p=2,
+            dim=1,
+        )
 
-    return None, 0.0, labels[top_indices[0]]
+        deep_vector = torch.cat(
+            [
+                cls_vector * np.sqrt(0.60),
+                patch_vector * np.sqrt(0.40),
+            ],
+            dim=1,
+        )
 
-def extract_features(image, feature_model, preprocess):
-    tensor = preprocess(image).unsqueeze(0)
+        deep_vector = F.normalize(
+            deep_vector,
+            p=2,
+            dim=1,
+        )[0].cpu().numpy().astype(np.float32)
 
-    with torch.inference_mode():
-        features = feature_model(tensor)
+    color_vector = color_histogram(image)
 
-    vector = features.flatten().cpu().numpy()
+    fused_vector = np.concatenate(
+        [
+            deep_vector * np.sqrt(DEEP_FEATURE_WEIGHT),
+            color_vector * np.sqrt(COLOR_FEATURE_WEIGHT),
+        ]
+    ).astype(np.float32)
 
-    return vector / (np.linalg.norm(vector) + 1e-10)
+    fused_vector /= np.linalg.norm(fused_vector) + 1e-12
+
+    return fused_vector, deep_vector
 
 @st.cache_data(show_spinner=False)
-def get_image_paths(dataset_path, max_images):
+def get_image_paths(dataset_path, max_per_category, extensions):
     root = Path(dataset_path)
 
-    if not root.exists():
+    if not root.is_dir():
         return []
 
     paths = []
-    categories = list(FOLDER_CATEGORIES.keys())
 
-    images_per_category = max(
-        1, max_images // len(categories)
-    )
+    for folder_name in FOLDER_CATEGORIES:
+        category_folder = root / folder_name
 
-    for folder_name in categories:
-        folder = root / folder_name
-
-        if not folder.exists():
+        if not category_folder.is_dir():
             continue
 
         category_images = sorted(
-            path for path in folder.rglob("*")
+            path
+            for path in category_folder.rglob("*")
             if path.is_file()
-            and path.suffix.lower() in EXTENSIONS
+            and path.suffix.lower() in extensions
         )
 
-        selected = category_images[:images_per_category]
-        paths.extend(str(path) for path in selected)
+        paths.extend(
+            str(path)
+            for path in category_images[:max_per_category]
+        )
 
     return paths
 
-@st.cache_data(show_spinner="Preparing image features...")
-def load_dataset_features(paths, model_version):
-    _, feature_model, preprocess, _ = load_models()
+
+@st.cache_data(
+    show_spinner=(
+        "Building the DINOv2 image-search index. "
+        "The first run may take a few minutes..."
+    )
+)
+def build_image_index(path_strings, model_version):
+    feature_model, processor = load_model()
 
     records = []
+    progress = st.progress(0, text="Indexing dataset images...")
+    total = len(path_strings)
 
-    for path_string in paths:
+    for i, path_string in enumerate(path_strings):
         path = Path(path_string)
+        category = FOLDER_CATEGORIES.get(path.parent.name.lower())
 
-        category = FOLDER_CATEGORIES.get(
-            path.parent.name.lower()
-        )
+        if category is not None:
+            try:
+                with Image.open(path) as image:
+                    fused_vector, deep_vector = extract_features(
+                        image,
+                        feature_model,
+                        processor,
+                    )
 
-        if category is None:
-            continue
+                records.append(
+                    {
+                        "path": path_string,
+                        "category": category,
+                        "features": fused_vector,
+                        "deep_features": deep_vector,
+                    }
+                )
 
-        try:
-            with Image.open(path) as source:
-                image = source.convert("RGB")
+            except Exception:
+                pass
 
-            features = extract_features(
-                image, feature_model, preprocess
+        if total:
+            progress.progress(
+                (i + 1) / total,
+                text=f"Indexing image {i + 1}/{total}...",
             )
 
-            records.append({
-                "path": path_string,
-                "category": category,
-                "features": features
-            })
-
-        except Exception:
-            continue
+    progress.empty()
 
     return records
 
-if not DATASET_PATH.exists():
+def retrieve(
+    query_vector,
+    query_deep_vector,
+    records,
+    top_k,
+    category_filter=None,
+):
+    candidates = [
+        record
+        for record in records
+        if category_filter is None
+        or record["category"] == category_filter
+    ]
+
+    if not candidates:
+        return [], 0
+
+    fused_matrix = np.stack(
+        [record["features"] for record in candidates]
+    )
+
+    deep_matrix = np.stack(
+        [record["deep_features"] for record in candidates]
+    )
+
+    fused_scores = fused_matrix @ query_vector
+    deep_scores = deep_matrix @ query_deep_vector
+
+    scores = 0.90 * deep_scores + 0.10 * fused_scores
+
+    ranked_indices = np.argsort(scores)[::-1]
+    results = []
+
+    for index in ranked_indices:
+        record = candidates[index]
+
+        results.append(
+            {
+                "path": record["path"],
+                "category": record["category"],
+                "score": float(scores[index]),
+            }
+        )
+
+        if len(results) >= top_k:
+            break
+
+    return results, len(candidates)
+
+def category_metrics(results, relevant_category, records):
+    if not results or relevant_category is None:
+        return None, None
+
+    relevant_retrieved = sum(
+        result["category"] == relevant_category
+        for result in results
+    )
+
+    precision_at_k = relevant_retrieved / len(results)
+
+    total_relevant = sum(
+        record["category"] == relevant_category
+        for record in records
+    )
+
+    recall_at_k = (
+        relevant_retrieved / total_relevant
+        if total_relevant
+        else 0.0
+    )
+
+    return precision_at_k, recall_at_k
+
+if not DATASET_PATH.is_dir():
     st.error(
-        f"Dataset folder not found at:\n{DATASET_PATH}\n\n"
-        "Make sure the dataset folder is beside app.py."
+        f"Dataset folder not found:\n\n`{DATASET_PATH}`\n\n"
+        "The dataset folder must be in the same repository directory as app.py."
+    )
+    st.stop()
+
+missing_folders = [
+    folder
+    for folder in FOLDER_CATEGORIES
+    if not (DATASET_PATH / folder).is_dir()
+]
+
+if missing_folders:
+    st.error(
+        "These required category folders are missing: "
+        + ", ".join(missing_folders)
     )
     st.stop()
 
 try:
-    classifier, feature_model, preprocess, labels = load_models()
+    feature_model, processor = load_model()
+
 except Exception as error:
     st.error(
-        "Could not load ResNet18. Check your internet "
-        "connection and make sure torch and torchvision "
-        "are installed."
+        "Could not load DINOv2 Small. Check transformers, torch, "
+        "and internet access for downloading the pretrained model."
     )
     st.exception(error)
     st.stop()
 
 paths = get_image_paths(
-    str(DATASET_PATH), MAX_IMAGES
+    str(DATASET_PATH),
+    MAX_IMAGES_PER_CATEGORY,
+    tuple(sorted(EXTENSIONS)),
 )
 
 if not paths:
-    st.error(
-        "No images found. Check that your dataset "
-        "contains image files inside the category folders."
-    )
+    st.error("No supported image files were found in the dataset folders.")
     st.stop()
 
-dataset_records = load_dataset_features(
-    paths, "resnet18-v2"
-)
+records = build_image_index(paths, INDEX_VERSION)
 
-if not dataset_records:
-    st.error(
-        "No image features could be loaded. "
-        "Check the folder names and image files."
-    )
+if not records:
+    st.error("No image features could be created. Check the dataset images.")
     st.stop()
 
-category_counts = {}
+counts = {
+    category: 0
+    for category in CATEGORY_NAMES
+}
 
-for record in dataset_records:
-    category = record["category"]
-    category_counts[category] = (
-        category_counts.get(category, 0) + 1
-    )
+for record in records:
+    counts[record["category"]] += 1
 
-st.success(
-    f"Ready! Loaded features for "
-    f"{len(dataset_records)} images."
-)
+m1, m2, m3 = st.columns(3)
 
-with st.expander("Dataset images by category"):
+m1.metric("Indexed images", len(records))
+m2.metric("Categories", sum(count > 0 for count in counts.values()))
+m3.metric("Max images per category", MAX_IMAGES_PER_CATEGORY)
+
+with st.expander("Dataset summary"):
     for category, name in CATEGORY_NAMES.items():
-        st.write(
-            f"{name}: {category_counts.get(category, 0)} images"
-        )
+        st.write(f"**{name}:** {counts[category]} images")
 
+st.subheader("Search")
+
+search_mode = st.radio(
+    "Where should the system search?",
+    ["All categories", "One category"],
+    horizontal=True,
+)
+
+category_filter = None
+
+if search_mode == "One category":
+    category_names = {
+        CATEGORY_NAMES[category]: category
+        for category in CATEGORY_NAMES
+        if counts[category] > 0
+    }
+
+    selected_name = st.selectbox(
+        "Select a category",
+        list(category_names),
+    )
+
+    category_filter = category_names[selected_name]
+
+top_k = st.slider(
+    "Number of results to retrieve (Top-K)",
+    min_value=1,
+    max_value=MAX_TOP_K,
+    value=DEFAULT_TOP_K,
+)
 
 uploaded_file = st.file_uploader(
-    "Upload an animal image",
-    type=["jpg", "jpeg", "png", "webp", "bmp"]
+    "Upload a query image",
+    type=["jpg", "jpeg", "png", "webp", "bmp"],
 )
 
 if uploaded_file is not None:
     try:
-        query_image = Image.open(
-            uploaded_file
-        ).convert("RGB")
+        query_image = Image.open(uploaded_file).convert("RGB")
 
-        st.subheader("Uploaded Image")
-        st.image(query_image, width=250)
+        st.subheader("Query image")
+        st.image(query_image, width=280)
 
-        category, confidence, predicted_label = predict_animal(
-            query_image,
-            classifier,
-            preprocess,
-            labels
-        )
-
-        if category is None:
-            st.warning(
-                "The model could not identify one of the "
-                "Animals-10 categories. Try a clearer image."
-            )
-            st.stop()
-
-        st.write(
-            f"Detected category: **{CATEGORY_NAMES[category]}**"
-        )
-
-        st.caption(
-            f"Model prediction: {predicted_label}"
-        )
-
-        candidates = [
-            item for item in dataset_records
-            if item["category"] == category
-        ]
-
-        if not candidates:
-            st.warning(
-                f"No {CATEGORY_NAMES[category].lower()} "
-                "images are available in the loaded dataset."
-            )
-            st.stop()
-
-        query_features = extract_features(
+        query_vector, query_deep_vector = extract_features(
             query_image,
             feature_model,
-            preprocess
+            processor,
         )
 
-        feature_matrix = np.stack([
-            item["features"] for item in candidates
-        ])
-
-        scores = cosine_similarity(
-            query_features.reshape(1, -1),
-            feature_matrix
-        )[0]
-
-        ranked_indices = np.argsort(scores)[::-1][
-            :min(TOP_RESULTS, len(candidates))
-        ]
-
-        st.subheader(
-            f"Similar {CATEGORY_NAMES[category]}"
+        results, candidate_count = retrieve(
+            query_vector,
+            query_deep_vector,
+            records,
+            top_k,
+            category_filter=category_filter,
         )
+
+        if not results:
+            st.warning(
+                "No results were found. Try another image "
+                "or change the category filter."
+            )
+            st.stop()
+
+        st.subheader("Retrieved images — ranked by visual similarity")
 
         st.caption(
-            f"Searching {len(candidates)} images "
-            "from this category."
+            f"Showing {len(results)} results from {candidate_count} "
+            "candidate images. Rank #1 has the highest score."
         )
 
-        columns = st.columns(len(ranked_indices))
+        for start in range(0, len(results), 5):
+            batch = results[start:start + 5]
+            columns = st.columns(len(batch))
 
-        for column, index in zip(columns, ranked_indices):
-            item = candidates[index]
+            for offset, (column, result) in enumerate(zip(columns, batch)):
+                with column:
+                    with Image.open(result["path"]) as image:
+                        st.image(
+                            image.convert("RGB"),
+                            use_container_width=True,
+                        )
 
-            with column:
-                with Image.open(item["path"]) as source:
-                    result_image = source.convert("RGB")
+                    st.write(f"**Rank #{start + offset + 1}**")
+                    st.write(
+                        f"Similarity score: {result['score']:.4f}"
+                    )
+                    st.caption(CATEGORY_NAMES[result["category"]])
+                    st.caption(Path(result["path"]).name)
 
-                st.image(
-                    result_image,
-                    use_container_width=True
-                )
+        st.info(
+            "Similarity scores are mathematical measures, not guaranteed "
+            "percentages of human-perceived similarity. This version uses "
+            "DINOv2 Small visual features combined with color features."
+        )
 
-                st.write(
-                    f"Similarity: {scores[index] * 100:.1f}%"
-                )
+        st.divider()
+        st.subheader("Optional IR evaluation")
 
-                st.caption(Path(item["path"]).name)
+        st.write(
+            "Choose the query image's known category to calculate "
+            "category-level Precision@K and Recall@K. These metrics "
+            "measure category matching, not fine-grained appearance similarity."
+        )
+
+        evaluation_options = ["Not specified"] + [
+            CATEGORY_NAMES[category]
+            for category in CATEGORY_NAMES
+        ]
+
+        known_query_category_name = st.selectbox(
+            "Known category of the query image",
+            evaluation_options,
+        )
+
+        if known_query_category_name != "Not specified":
+            name_to_category = {
+                name: category
+                for category, name in CATEGORY_NAMES.items()
+            }
+
+            known_query_category = name_to_category[
+                known_query_category_name
+            ]
+
+            precision, recall = category_metrics(
+                results,
+                known_query_category,
+                records,
+            )
+
+            eval1, eval2 = st.columns(2)
+
+            eval1.metric(
+                f"Precision@{len(results)}",
+                f"{precision * 100:.1f}%",
+            )
+
+            eval2.metric(
+                f"Recall@{len(results)}",
+                f"{recall * 100:.1f}%",
+            )
 
     except Exception as error:
-        st.error(
-            "An error occurred while processing the image."
-        )
+        st.error("An error occurred while processing the query image.")
         st.exception(error)
